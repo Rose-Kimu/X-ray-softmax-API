@@ -1,67 +1,84 @@
-# Correct code
 import uvicorn
 from fastapi import FastAPI, File, UploadFile
 import cv2
 import numpy as np
 from tensorflow.keras.models import load_model
 import os
+import lime
+from lime import lime_image
+from skimage.segmentation import mark_boundaries
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras.preprocessing import image
+import base64
 
 app = FastAPI()
 
 # Load the model with the correct local file path
-# loaded_model = load_model('best_model.h5')
-
-model_path = os.path.abspath('best_model.h5')
-print(model_path)
-
-# Load the model with the correct absolute file path
+model_path = os.path.abspath('densenet_model.h5')
 loaded_model = load_model(model_path)
-loaded_model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+loaded_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
 
 classes = {
     0: 'Normal',
-    1: 'Tuberculosis'
+    1: 'Tuberculosis',
+    2: 'Pneumonia'
 }
+
+def preprocess_image(image_path, target_size=(128, 128)):
+    img = image.load_img(image_path, target_size=target_size)
+    img_array = image.img_to_array(img)
+    img_array = np.expand_dims(img_array, axis=0)
+    return img_array
+
+def lime_explain(model, image, class_index):
+    explainer = lime_image.LimeImageExplainer()
+    explanation = explainer.explain_instance(image[0].astype('uint8'), model.predict, top_labels=1, hide_color=0, num_samples=1000)
+    temp, mask = explanation.get_image_and_mask(class_index, positive_only=True, num_features=5, hide_rest=False)
+    img_boundry1 = mark_boundaries(temp / 2 + 0.5, mask, color=(0, 0, 1))
+    return img_boundry1
+
+def adjust_contrast_brightness(image, alpha=1.5, beta=25):
+    adjusted_image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+    return adjusted_image
+
+def image_to_base64(image):
+    retval, buffer = cv2.imencode('.jpg', image)
+    image_base64 = base64.b64encode(buffer).decode('utf-8')
+    return image_base64
 
 @app.post("/predict/")
 async def predict(file: UploadFile = File(...)):
-    # Read image file
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
     image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    
-    # Resize image
     image_resized = cv2.resize(image, (128, 128))
-    
-    # Convert to RGB and normalize
     image_rgb = cv2.cvtColor(image_resized, cv2.COLOR_BGR2RGB)
     image_normalized = image_rgb / 255.0
-    
-    # Expand dimensions
     image_expanded = np.expand_dims(image_normalized, axis=0)
     
-    # Make prediction
     prediction = loaded_model.predict(image_expanded)
-    predicted_class_prob = prediction[0][0]
+    softmax_probabilities = tf.nn.softmax(prediction[0]).numpy()
+    predicted_class_idx = np.argmax(softmax_probabilities)
+    predicted_class = classes[predicted_class_idx]
     
-    if predicted_class_prob >= 0.5:
-        predicted_class = 1
-    else:
-        predicted_class = 0
+    preprocessed_image_uint8 = (image_expanded * 255).astype('uint8')
+    lime_explanation = lime_explain(loaded_model, preprocessed_image_uint8, predicted_class_idx)
+    lime_explanation_resized = cv2.resize(lime_explanation, (preprocessed_image_uint8.shape[2], preprocessed_image_uint8.shape[1]))
+    original_image_adjusted = adjust_contrast_brightness(preprocessed_image_uint8[0])
+    lime_explanation_adjusted = adjust_contrast_brightness(lime_explanation_resized)
+    superimposed_img = cv2.addWeighted(original_image_adjusted, 0.6, lime_explanation_adjusted, 0.4, 0)
     
-    predicted_class = classes[predicted_class]
+    original_image_base64 = image_to_base64(cv2.cvtColor(original_image_adjusted, cv2.COLOR_BGR2RGB))
+    superimposed_image_base64 = image_to_base64(cv2.cvtColor(superimposed_img, cv2.COLOR_BGR2RGB))
     
-    return {"Prediction": predicted_class}
+    return {
+        "Prediction": predicted_class,
+        "Probability": float(softmax_probabilities[predicted_class_idx]),
+        "Softmax Probabilities": softmax_probabilities.tolist(),
+        "Original Image": original_image_base64,
+        "Superimposed Image": superimposed_image_base64
+    }
 
-@app.get("/")
-async def read_root():
-    return {"message": "Welcome to the Image Classification API"}
-
-@app.get("/go")
-async def read_go():
-    return {"message": "Welcome to the GO PAGE"}
-
-
-    
-
-
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
